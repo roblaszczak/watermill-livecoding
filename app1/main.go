@@ -11,6 +11,8 @@ import (
 	"os"
 	"os/signal"
 	"time"
+
+	"github.com/lmittmann/tint"
 )
 
 type BookRoomRequest struct {
@@ -38,6 +40,8 @@ func (h RoomBookingHandler) Handler(writer http.ResponseWriter, request *http.Re
 		return
 	}
 
+	slog.With("req", req).Info("Booking room")
+
 	roomPrice := 42 * req.GuestsCount
 
 	err = h.payments.TakePayment(roomPrice)
@@ -51,6 +55,10 @@ func (h RoomBookingHandler) Handler(writer http.ResponseWriter, request *http.Re
 type PaymentsProvider struct{}
 
 func (p PaymentsProvider) TakePayment(amount int) error {
+	logger := slog.With("amount", amount)
+
+	logger.Info("Taking payment")
+
 	// this is not the best payment provider...
 	if rand.Int31n(2) == 0 {
 		time.Sleep(time.Second * 5)
@@ -59,11 +67,19 @@ func (p PaymentsProvider) TakePayment(amount int) error {
 		return errors.New("random error")
 	}
 
-	slog.Info("Payment taken")
+	logger.Info("Payment taken")
+
 	return nil
 }
 
 func main() {
+	slog.SetDefault(slog.New(
+		tint.NewHandler(os.Stderr, &tint.Options{
+			Level:      slog.LevelInfo,
+			TimeFormat: time.Kitchen,
+		}),
+	))
+
 	slog.Info("Starting app")
 
 	h := RoomBookingHandler{
