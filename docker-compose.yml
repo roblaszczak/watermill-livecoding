@@ -19,7 +19,7 @@ services:
 
   zookeeper:
     container_name: zk
-    image: confluentinc/cp-zookeeper:latest
+    image: confluentinc/cp-zookeeper:7.7.1
     platform: linux/amd64
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
@@ -29,7 +29,7 @@ services:
 
   kafka:
     container_name: kafka
-    image: confluentinc/cp-kafka:latest
+    image: confluentinc/cp-kafka:7.7.1
     platform: linux/amd64
     depends_on:
       - zookeeper
@@ -45,7 +45,7 @@ services:
 
   googlecloud:
     container_name: gcpps
-    image: google/cloud-sdk:390.0.0
+    image: google/cloud-sdk:498.0.0
     entrypoint: gcloud --quiet beta emulators pubsub start --host-port=0.0.0.0:8085 --verbosity=debug --log-http
     ports:
       - 8085:8085

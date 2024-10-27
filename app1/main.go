@@ -4,17 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"math/rand"
 	"net/http"
 	"os"
 	"os/signal"
 	"time"
-
-	"github.com/go-chi/chi/v5"
-	chiMiddleware "github.com/go-chi/chi/v5/middleware"
 )
 
 type BookRoomRequest struct {
@@ -29,6 +25,7 @@ type RoomBookingHandler struct {
 func (h RoomBookingHandler) Handler(writer http.ResponseWriter, request *http.Request) {
 	b, err := io.ReadAll(request.Body)
 	if err != nil {
+		slog.With("err", err).Error("Failed to read request body")
 		writer.WriteHeader(http.StatusBadRequest)
 		return
 	}
@@ -36,6 +33,7 @@ func (h RoomBookingHandler) Handler(writer http.ResponseWriter, request *http.Re
 	req := BookRoomRequest{}
 	err = json.Unmarshal(b, &req)
 	if err != nil {
+		slog.With("err", err).Error("Failed to unmarshal request")
 		writer.WriteHeader(http.StatusBadRequest)
 		return
 	}
@@ -44,8 +42,8 @@ func (h RoomBookingHandler) Handler(writer http.ResponseWriter, request *http.Re
 
 	err = h.payments.TakePayment(roomPrice)
 	if err != nil {
+		slog.With("err", err).Error("Failed to take payment")
 		writer.WriteHeader(http.StatusInternalServerError)
-		fmt.Println("Failed to take payment")
 		return
 	}
 }
@@ -61,20 +59,18 @@ func (p PaymentsProvider) TakePayment(amount int) error {
 		return errors.New("random error")
 	}
 
-	log.Println("payment taken")
+	slog.Info("Payment taken")
 	return nil
 }
 
 func main() {
-	log.Println("Starting app")
+	slog.Info("Starting app")
 
 	h := RoomBookingHandler{
 		payments: PaymentsProvider{},
 	}
 
-	chiRouter := chi.NewRouter()
-	chiRouter.Use(chiMiddleware.Recoverer)
-	chiRouter.Post("/book", h.Handler)
+	http.HandleFunc("POST /book", h.Handler)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -85,18 +81,18 @@ func main() {
 		cancel()
 	}()
 
-	runHTTP(ctx, chiRouter)
+	runHTTP(ctx)
 }
 
-func runHTTP(ctx context.Context, handler http.Handler) {
-	log.Println("Running router")
-	server := &http.Server{Addr: ":8080", Handler: handler}
+func runHTTP(ctx context.Context) {
+	slog.Info("Running HTTP server")
+	server := &http.Server{Addr: ":8080", Handler: http.DefaultServeMux}
 	go func() {
 		<-ctx.Done()
 		_ = server.Close()
 	}()
 
-	if err := server.ListenAndServe(); err != http.ErrServerClosed {
+	if err := server.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 		panic(err)
 	}
 }
