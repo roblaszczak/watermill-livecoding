@@ -61,7 +61,7 @@ func (p PaymentsProvider) TakePayment(amount int) error {
 
 	// this is not the best payment provider...
 	if rand.Int31n(2) == 0 {
-		time.Sleep(time.Second * 5)
+		time.Sleep(time.Second * 3)
 	}
 	if rand.Int31n(3) == 0 {
 		return errors.New("random error")
