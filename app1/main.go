@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/lmittmann/tint"
 )
 
@@ -42,9 +43,10 @@ func (h RoomBookingHandler) Handler(writer http.ResponseWriter, request *http.Re
 
 	slog.With("req", req).Info("Booking room")
 
+	bookingID := uuid.NewString()
 	roomPrice := 42 * req.GuestsCount
 
-	err = h.payments.TakePayment(roomPrice)
+	err = h.payments.TakePayment(bookingID, roomPrice)
 	if err != nil {
 		slog.With("err", err).Error("Failed to take payment")
 		writer.WriteHeader(http.StatusInternalServerError)
@@ -54,8 +56,8 @@ func (h RoomBookingHandler) Handler(writer http.ResponseWriter, request *http.Re
 
 type PaymentsProvider struct{}
 
-func (p PaymentsProvider) TakePayment(amount int) error {
-	logger := slog.With("amount", amount)
+func (p PaymentsProvider) TakePayment(bookingID string, amount int) error {
+	logger := slog.With("amount", amount, "booking_id", bookingID)
 
 	logger.Info("Taking payment")
 
