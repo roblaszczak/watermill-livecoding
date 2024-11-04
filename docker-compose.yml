@@ -20,7 +20,6 @@ services:
     container_name: zk
     attach: false
     image: confluentinc/cp-zookeeper:7.7.1
-    platform: linux/amd64
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
@@ -31,7 +30,6 @@ services:
     container_name: kafka
     attach: false
     image: confluentinc/cp-kafka:7.7.1
-    platform: linux/amd64
     depends_on:
       - zookeeper
     ports:
