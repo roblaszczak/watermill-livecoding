@@ -1,4 +1,4 @@
-FROM golang:1.18
+FROM golang:1.23
 
 RUN go install github.com/cespare/reflex@v0.3.1
 

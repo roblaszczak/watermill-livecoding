@@ -4,20 +4,21 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"math/rand"
 	"net/http"
 	"os"
 	"os/signal"
-	"sync"
 	"time"
 
 	"github.com/ThreeDotsLabs/watermill"
-	"github.com/ThreeDotsLabs/watermill-googlecloud/pkg/googlecloud"
+	"github.com/ThreeDotsLabs/watermill-kafka/v3/pkg/kafka"
+	"github.com/ThreeDotsLabs/watermill/components/cqrs"
 	"github.com/ThreeDotsLabs/watermill/message"
-	"github.com/go-chi/chi/v5"
-	chiMiddleware "github.com/go-chi/chi/v5/middleware"
+	"github.com/google/uuid"
+	"github.com/lmittmann/tint"
 )
 
 type BookRoomRequest struct {
@@ -26,10 +27,13 @@ type BookRoomRequest struct {
 }
 
 type RoomBookingHandler struct {
-	publisher message.Publisher
+	payments PaymentsProvider
+
+	eventBus *cqrs.EventBus
 }
 
 type RoomBooked struct {
+	BookingID   string `json:"booking_id"`
 	RoomID      string `json:"room_id"`
 	GuestsCount int    `json:"guests_count"`
 	Price       int    `json:"price"`
@@ -38,125 +42,175 @@ type RoomBooked struct {
 func (h RoomBookingHandler) Handler(writer http.ResponseWriter, request *http.Request) {
 	b, err := io.ReadAll(request.Body)
 	if err != nil {
-		panic(err)
+		slog.With("err", err).Error("Failed to read request body")
+		writer.WriteHeader(http.StatusBadRequest)
+		return
 	}
 
 	req := BookRoomRequest{}
 	err = json.Unmarshal(b, &req)
 	if err != nil {
-		panic(err)
+		slog.With("err", err).Error("Failed to unmarshal request")
+		writer.WriteHeader(http.StatusBadRequest)
+		return
 	}
 
+	slog.With("req", req).Info("Booking room")
+
+	bookingID := uuid.NewString()
 	roomPrice := 42 * req.GuestsCount
 
-	event := RoomBooked{
+	rb := RoomBooked{
+		BookingID:   bookingID,
 		RoomID:      req.RoomID,
 		GuestsCount: req.GuestsCount,
 		Price:       roomPrice,
 	}
 
-	payload, err := json.Marshal(event)
+	err = h.eventBus.Publish(request.Context(), rb)
 	if err != nil {
-		panic(err)
+		slog.With("err", err).Error("Failed to publish room booked event")
+		writer.WriteHeader(http.StatusInternalServerError)
+		return
 	}
-
-	err = h.publisher.Publish("bookings", message.NewMessage(watermill.NewUUID(), payload))
-	if err != nil {
-		panic(err)
-	}
-}
-
-type PaymentsHandler struct {
-	provider PaymentsProvider
-}
-
-type PaymentTaken struct {
-	RoomID string `json:"room_id"`
-	Price  int    `json:"price"`
-}
-
-func (p PaymentsHandler) Handler(msg *message.Message) (messages []*message.Message, err error) {
-	roomBooked := RoomBooked{}
-
-	err = json.Unmarshal(msg.Payload, &roomBooked)
-	if err != nil {
-		return nil, err
-	}
-
-	err = p.provider.TakePayment(roomBooked.Price)
-	if err != nil {
-		return nil, err
-	}
-
-	event := PaymentTaken{
-		RoomID: roomBooked.RoomID,
-		Price:  roomBooked.Price,
-	}
-
-	payload, err := json.Marshal(event)
-	if err != nil {
-		panic(err)
-	}
-
-	return message.Messages{message.NewMessage(watermill.NewUUID(), payload)}, nil
 }
 
 type PaymentsProvider struct{}
 
-func (p PaymentsProvider) TakePayment(amount int) error {
+func (p PaymentsProvider) TakePayment(bookingID string, amount int) error {
+	logger := slog.With("amount", amount, "booking_id", bookingID)
+
+	logger.Info("Taking payment")
+
 	// this is not the best payment provider...
 	if rand.Int31n(2) == 0 {
-		time.Sleep(time.Second * 5)
+		time.Sleep(time.Second * 3)
 	}
 	if rand.Int31n(3) == 0 {
 		return errors.New("random error")
 	}
 
-	log.Println("payment taken")
+	logger.Info("Payment taken")
+
 	return nil
 }
 
+type PaymentsHandler struct {
+	paymentsProvider PaymentsProvider
+	eventBus         *cqrs.EventBus
+}
+
+type PaymentTaken struct {
+	BookingID string `json:"booking_id"`
+	RoomID    string `json:"room_id"`
+	Price     int    `json:"price"`
+}
+
+func (p PaymentsHandler) Handler(ctx context.Context, rb *RoomBooked) (err error) {
+	if err := p.paymentsProvider.TakePayment(rb.BookingID, rb.Price); err != nil {
+		return err
+	}
+
+	return p.eventBus.Publish(ctx, PaymentTaken{
+		BookingID: rb.BookingID,
+		RoomID:    rb.RoomID,
+		Price:     rb.Price,
+	})
+}
+
 func main() {
-	log.Println("Starting app")
+	slog.SetDefault(slog.New(
+		tint.NewHandler(os.Stderr, &tint.Options{
+			Level:      slog.LevelInfo,
+			TimeFormat: time.Kitchen,
+		}),
+	))
 
-	watermillLogger := watermill.NewStdLogger(true, false)
+	watermillLogger := watermill.NewSlogLoggerWithLevelMapping(
+		slog.With("watermill", true),
+		map[slog.Level]slog.Level{
+			slog.LevelInfo: slog.LevelDebug,
+		},
+	)
 
-	subscriber, err := googlecloud.NewSubscriber(googlecloud.SubscriberConfig{}, watermillLogger)
-	if err != nil {
-		panic(err)
-	}
-	publisher, err := googlecloud.NewPublisher(googlecloud.PublisherConfig{}, watermillLogger)
-	if err != nil {
-		panic(err)
-	}
-
-	h := RoomBookingHandler{publisher}
-
-	watermillRouter, err := message.NewRouter(
-		message.RouterConfig{},
+	publisher, err := kafka.NewPublisher(
+		kafka.PublisherConfig{
+			Brokers:   []string{"kafka:9092"},
+			Marshaler: kafka.DefaultMarshaler{},
+		},
 		watermillLogger,
 	)
 	if err != nil {
 		panic(err)
 	}
 
-	watermillRouter.AddHandler(
-		"payments",
-		"bookings",
-		subscriber,
-		"payments",
-		publisher,
-		PaymentsHandler{}.Handler,
-	)
+	slog.Info("Starting app")
 
-	chiRouter := chi.NewRouter()
-	chiRouter.Use(chiMiddleware.Recoverer)
-	chiRouter.Post("/book", h.Handler)
+	router := message.NewDefaultRouter(watermillLogger)
+
+	marshaler := cqrs.JSONMarshaler{
+		GenerateName: cqrs.StructName,
+	}
+
+	eventBus, err := cqrs.NewEventBusWithConfig(publisher, cqrs.EventBusConfig{
+		GeneratePublishTopic: func(params cqrs.GenerateEventPublishTopicParams) (string, error) {
+			return params.EventName, nil
+		},
+		Marshaler: marshaler,
+		Logger:    watermillLogger,
+	})
+	if err != nil {
+		panic(err)
+	}
+
+	eventProcessor, err := cqrs.NewEventProcessorWithConfig(router, cqrs.EventProcessorConfig{
+		GenerateSubscribeTopic: func(params cqrs.EventProcessorGenerateSubscribeTopicParams) (string, error) {
+			return params.EventName, nil
+		},
+		SubscriberConstructor: func(params cqrs.EventProcessorSubscriberConstructorParams) (message.Subscriber, error) {
+			return kafka.NewSubscriber(
+				kafka.SubscriberConfig{
+					Brokers:       []string{"kafka:9092"},
+					ConsumerGroup: params.HandlerName,
+					Unmarshaler:   kafka.DefaultMarshaler{},
+				},
+				watermillLogger,
+			)
+		},
+		Marshaler: marshaler,
+		Logger:    watermillLogger,
+	})
+	if err != nil {
+		panic(err)
+	}
+
+	h := RoomBookingHandler{
+		payments: PaymentsProvider{},
+		eventBus: eventBus,
+	}
+
+	paymentsHandler := PaymentsHandler{
+		eventBus: eventBus,
+	}
+
+	err = eventProcessor.AddHandlers(
+		cqrs.NewEventHandler("payments", paymentsHandler.Handler),
+		cqrs.NewEventHandler("payments_report", func(ctx context.Context, event *PaymentTaken) error {
+			fmt.Printf("Reporting payment taken: %#v\n", event)
+			return nil
+		}),
+		cqrs.NewEventHandler("payments_report_v2", func(ctx context.Context, event *PaymentTaken) error {
+			fmt.Printf("Reporting payment taken (v2): %#v\n", event)
+			return nil
+		}),
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	http.HandleFunc("POST /book", h.Handler)
 
 	ctx, cancel := context.WithCancel(context.Background())
-
-	wg := sync.WaitGroup{}
-	wg.Add(2)
 
 	go func() {
 		c := make(chan os.Signal, 1)
@@ -166,34 +220,29 @@ func main() {
 	}()
 
 	go func() {
-		defer wg.Done()
-		runHTTP(ctx, chiRouter)
-	}()
-
-	go func() {
-		defer wg.Done()
-
-		err := watermillRouter.Run(ctx)
+		err := router.Run(context.Background())
 		if err != nil {
-			panic(err)
+			slog.With("err", err).Error("Failed to start watermill router")
 		}
 	}()
 
-	// waiting for routers for proper graceful shutdown
-	wg.Wait()
-	log.Println("Server stopped")
+	runHTTP(ctx)
 
+	err = router.Close()
+	if err != nil {
+		slog.With("err", err).Warn("Failed to close Watermill router")
+	}
 }
 
-func runHTTP(ctx context.Context, handler http.Handler) {
-	log.Println("Running router")
-	server := &http.Server{Addr: ":8080", Handler: handler}
+func runHTTP(ctx context.Context) {
+	slog.Info("Running HTTP server")
+	server := &http.Server{Addr: ":8080", Handler: http.DefaultServeMux}
 	go func() {
 		<-ctx.Done()
 		_ = server.Close()
 	}()
 
-	if err := server.ListenAndServe(); err != http.ErrServerClosed {
+	if err := server.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 		panic(err)
 	}
 }
